@@ -67,6 +67,12 @@ impl ServerConfig {
                         i += 1;
                     }
                 }
+                "--output" => {
+                    if i + 1 < args.len() {
+                        config.output_name = Some(args[i + 1].clone());
+                        i += 1;
+                    }
+                }
                 "-h" | "--help" => {
                     print_help();
                     std::process::exit(0);
@@ -87,6 +93,12 @@ impl ServerConfig {
             config.bitrate = bitrate.parse().unwrap_or(config.bitrate);
         }
 
+        config.fps = config.fps.clamp(1, 240);
+        config.bitrate = config.bitrate.max(1000);
+        config.keyframe_interval = config.keyframe_interval.max(1);
+        if config.port == 0 {
+            config.port = Self::default().port;
+        }
         config
     }
 }
@@ -99,9 +111,10 @@ fn print_help() {
     println!();
     println!("OPTIONS:");
     println!("    -p, --port <PORT>              UDP port to listen on [default: 9999]");
-    println!("    -f, --fps <FPS>                Target frame rate [default: 100]");
+    println!("    -f, --fps <FPS>                Target frame rate [default: 60]");
     println!("    -b, --bitrate <KBPS>           Target bitrate in kbps [default: 8000]");
     println!("    -k, --keyframe-interval <N>    Keyframe interval in frames [default: 10]");
+    println!("    --output <NAME>               Override input monitor (e.g. DP-3)");
     println!("    -h, --help                     Print help information");
     println!();
     println!("ENVIRONMENT VARIABLES:");

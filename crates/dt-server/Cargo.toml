@@ -19,6 +19,7 @@ dt-protocol = { workspace = true }
 dt-input = { workspace = true }
 dt-capture = { workspace = true }
 dt-encoder = { workspace = true }
-eframe = "0.33.3"
+eframe = { version = "0.33.3", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
 image = { version = "0.24", default-features = false, features = ["png"] }
 chrono = "0.4.43"
+serde_json = "1"

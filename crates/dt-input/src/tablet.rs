@@ -232,6 +232,14 @@ impl VirtualTablet {
         })
     }
 
+    /// Kernel paths identify only the devices created by this instance.
+    pub fn device_syspaths(&mut self) -> std::io::Result<[std::path::PathBuf; 2]> {
+        Ok([
+            self.pen_device.get_syspath()?,
+            self.touch_device.get_syspath()?,
+        ])
+    }
+
     /// Get the coordinate space dimensions.
     pub fn dimensions(&self) -> (u32, u32) {
         (self.width, self.height)

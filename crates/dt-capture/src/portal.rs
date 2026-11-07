@@ -2,10 +2,10 @@
 
 use ashpd::desktop::screencast::{CursorMode, Screencast, SourceType};
 use ashpd::desktop::PersistMode;
+use std::any::Any;
+use std::sync::Arc;
 use thiserror::Error;
 use tracing::info;
-use std::sync::Arc;
-use std::any::Any;
 
 /// Errors that can occur during portal operations.
 #[derive(Debug, Error)]
@@ -25,6 +25,9 @@ pub enum PortalError {
 pub struct MonitorInfo {
     /// PipeWire node ID for the stream.
     pub node_id: u32,
+    /// Selected monitor origin in compositor coordinates.
+    pub position: Option<(i32, i32)>,
+    pub mapping_id: Option<String>,
     /// Width of the captured area.
     pub width: u32,
     /// Height of the captured area.
@@ -85,6 +88,8 @@ pub async fn select_monitor(restore_token: Option<&str>) -> Result<MonitorInfo, 
 
     Ok(MonitorInfo {
         node_id: stream.pipe_wire_node_id(),
+        position: stream.position(),
+        mapping_id: stream.mapping_id().map(str::to_owned),
         width: width as u32,
         height: height as u32,
         restore_token: response.restore_token().map(|s| s.to_string()),

@@ -195,7 +195,26 @@ just android-deploy
 just run-release
 ```
 *   On first run, a "Screen Share" dialog will appear (handled by XDG Portal). Select the screen you want to mirror.
-*   The server listens on **TCP/UDP Port 9867** (TCP for input, UDP for video).
+*   The server listens on **TCP/UDP Port 9999** (TCP for input, UDP for video).
+
+### Monitor mapping (KDE Wayland)
+
+The server automatically maps its own virtual pen and touch devices to the monitor
+selected in the screen-sharing dialog. You can leave the physical mouse on another
+monitor. This requires `kscreen-doctor` and `busctl`, normally included with Plasma
+and systemd. The server log reports whether mapping succeeded.
+
+If the portal does not identify the monitor, enter its connector name in **Input
+monitor** before starting (for example `DP-3`; list names with `kscreen-doctor -o`).
+Select that same monitor in the sharing dialog. Other desktops require mapping
+**Drawing Tablet Pen** and **Drawing Tablet Touch** through desktop settings.
+Keyboard focus still follows the desktop's normal window activation rules.
+
+All changes are server-side and use the existing APK protocol. Use the server's
+shown port (default **9999**) in the app; older APKs may prefill **9867**. Existing
+saved server addresses can keep their current port by setting the server to match.
+The APK does not send its video viewport geometry, so a client-side letterboxing
+coordinate mismatch cannot be corrected reliably on the server alone.
 
 ### 2. Start the Client
 1.  Open the **Drawing Tablet** app on Android.
@@ -269,7 +288,7 @@ We use the Linux kernel's `uinput` module to create two virtual devices:
 ## ❓ Troubleshooting
 
 **Q: Connection fails immediately.**
-*   Check your firewall (`sudo ufw allow 9867/tcp` and `sudo ufw allow 9867/udp`).
+*   Check your firewall (`sudo ufw allow 9999/tcp` and `sudo ufw allow 9999/udp`).
 *   Ensure both devices are on the same 5GHz WiFi network.
 
 **Q: "Failed to create virtual device" error.**

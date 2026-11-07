@@ -6,6 +6,8 @@
 
 mod config;
 mod gui;
+mod icons;
+mod mapping;
 mod network;
 
 use anyhow::Result;
@@ -85,10 +87,12 @@ fn main() -> Result<()> {
     }
     let running_flag = Arc::new(AtomicBool::new(false));
 
-    let app = DtServerApp::new(stats, running_flag);
+    let app = DtServerApp::new(stats, running_flag, ServerConfig::from_args());
 
     let mut native_options = eframe::NativeOptions::default();
-    native_options.viewport.inner_size = Some(eframe::egui::vec2(1000.0, 700.0));
+    native_options.viewport.inner_size = Some(eframe::egui::vec2(1280.0, 800.0));
+
+    native_options.viewport.min_inner_size = Some(eframe::egui::vec2(1040.0, 740.0));
 
     // Load icon
     let icon_data = include_bytes!("../assets/icon.png");
@@ -159,8 +163,18 @@ pub async fn run_server_async(
 
     // Create virtual tablet
     info!("Creating virtual tablet device...");
-    let tablet = VirtualTablet::new(monitor.width, monitor.height, &config.tablet)?;
+    let mut tablet = VirtualTablet::new(monitor.width, monitor.height, &config.tablet)?;
     info!("Virtual tablet created");
+    let mapping_message =
+        match mapping::map_tablet(&monitor, &mut tablet, config.output_name.as_deref()).await {
+            Ok(name) => format!("Pen and touch mapped to {name}"),
+            Err(e) => format!("Display mapping needs attention: {e}. See mapping help."),
+        };
+    {
+        let mut guard = stats.lock().unwrap();
+        guard.log(mapping_message.clone());
+        guard.mapping = mapping_message;
+    }
 
     // Create encoder
     let encoder_config = EncoderConfig {
@@ -202,6 +216,9 @@ pub async fn run_server_async(
     {
         let mut guard = stats.lock().unwrap();
         guard.status = "Running".to_string();
+        guard.log(format!("Server listening on port {}", config.port));
+        let resolution = guard.resolution.clone();
+        guard.log(format!("Capturing {resolution} at {} fps", config.fps));
     }
 
     // Run the main server loop
@@ -290,7 +307,6 @@ async fn run_server(
     // Per-second stats
     let mut stats_captured: u64 = 0;
     let mut stats_encoded: u64 = 0;
-    let mut stats_sent: u64 = 0;
     let mut stats_keyframes: u64 = 0;
     let mut stats_fragments: u64 = 0;
     let mut stats_dropped_frames: u64 = 0;
@@ -323,6 +339,7 @@ async fn run_server(
                             udp_addr: Some(udp_addr),
                         });
 
+                        stats.lock().unwrap().log(format!("Tablet connected from {}", addr.ip()));
                         info!("New client {} connected from {}", client_id, addr);
                     }
                     Err(e) => {
@@ -365,6 +382,7 @@ async fn run_server(
                                         info!("Client {} requested disconnect", c.tcp_client_id);
                                         tcp_server.disconnect_client(c.tcp_client_id).await;
                                         event_retimer.reset();
+                                        stats.lock().unwrap().log("Tablet disconnected".into());
                                         client = None;
                                     }
                                     ControlPacket::Heartbeat => {
@@ -388,6 +406,7 @@ async fn run_server(
                                     if button < 2 {
                                         let mut guard = stats.lock().unwrap();
                                         guard.stylus_buttons[button as usize] = pressed;
+                                        guard.log(format!("Stylus button {} {}", button + 1, if pressed {"pressed"} else {"released"}));
                                     }
                                 }
 
@@ -426,7 +445,7 @@ async fn run_server(
         }
 
         // Update connected client in GUI stats
-        if sequence.is_multiple_of(60) {
+        {
             let mut guard = stats.lock().unwrap();
             guard.connected_client = client
                 .as_ref()
@@ -512,7 +531,6 @@ async fn run_server(
                         }
                     }
                     if all_sent {
-                        stats_sent += 1;
                         stats_fragments += fragment_count as u64;
                     }
                 }
@@ -535,8 +553,8 @@ async fn run_server(
                 let mut guard = stats.lock().unwrap();
                 guard.captured = stats_captured;
                 guard.encoded = stats_encoded;
-                guard.dropped = stats_dropped_frames;
-                guard.sent = stats_sent;
+                guard.dropped += stats_dropped_frames;
+                guard.sent += stats_fragments;
                 guard.keyframes = stats_keyframes;
                 guard.fragments = stats_fragments;
                 guard.errors = stats_encode_errors;
@@ -545,7 +563,6 @@ async fn run_server(
             stats_captured = 0;
             stats_dropped_frames = 0;
             stats_encoded = 0;
-            stats_sent = 0;
             stats_keyframes = 0;
             stats_fragments = 0;
             stats_encode_errors = 0;
@@ -557,6 +574,7 @@ async fn run_server(
 
     // Close channel to stop encoder thread
     drop(frame_tx);
+    drop(encoded_rx); // Unblock a producer waiting on a full output channel.
     encoder_running.store(false, Ordering::SeqCst);
 
     if let Err(e) = encoder_handle.join() {

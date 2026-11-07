@@ -1,11 +1,21 @@
 use crate::config::ServerConfig;
-use dt_input::TabletDescriptor;
-use eframe::egui;
-use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
-use tokio::runtime::Runtime;
-use tokio::task::JoinHandle;
+use crate::icons::{icon_image, Icon};
+use eframe::egui::{self, Color32, RichText, Vec2};
+use std::{
+    collections::VecDeque,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
+    time::Duration,
+};
+use tokio::{runtime::Runtime, task::JoinHandle};
+
+const GREEN: Color32 = Color32::from_rgb(25, 128, 74);
+const INK: Color32 = Color32::from_rgb(34, 42, 38);
+const MUTED: Color32 = Color32::from_rgb(96, 111, 105);
+const BG: Color32 = Color32::from_rgb(243, 246, 245);
+const BORDER: Color32 = Color32::from_rgb(220, 227, 223);
 
 #[derive(Clone, Default)]
 pub struct ServerStats {
@@ -19,495 +29,504 @@ pub struct ServerStats {
     pub connected_client: Option<String>,
     pub resolution: String,
     pub status: String,
+    pub mapping: String,
     pub stylus_buttons: [bool; 2],
     pub logs: VecDeque<String>,
 }
-
 impl ServerStats {
     pub fn log(&mut self, msg: String) {
         self.logs.push_back(format!(
-            "[{}] {}",
+            "{}   {}",
             chrono::Local::now().format("%H:%M:%S"),
             msg
         ));
-        if self.logs.len() > 50 {
+        if self.logs.len() > 100 {
             self.logs.pop_front();
         }
     }
 }
 
 pub struct DtServerApp {
-    // Shared state
     stats: Arc<Mutex<ServerStats>>,
     running_flag: Arc<AtomicBool>,
-
-    // Config state (editable when stopped)
     port_input: String,
     bitrate_input: String,
     keyframe_input: String,
-
-    // Help Dialog
-    show_help_dialog: bool,
-
-    // Runtime and Task
+    fps_input: String,
+    output_input: String,
+    config: ServerConfig,
+    address: String,
+    started: Option<String>,
+    show_help: bool,
     rt: Runtime,
     server_task: Option<JoinHandle<()>>,
 }
-
 impl DtServerApp {
-    pub fn new(stats: Arc<Mutex<ServerStats>>, running_flag: Arc<AtomicBool>) -> Self {
-        // Create a persistent Tokio runtime
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .expect("Failed to create Tokio runtime");
-
-        // Apply custom style once
+    pub fn new(
+        stats: Arc<Mutex<ServerStats>>,
+        running_flag: Arc<AtomicBool>,
+        config: ServerConfig,
+    ) -> Self {
+        // Connecting a UDP socket only chooses a local route; it sends no packets.
+        let address = std::net::UdpSocket::bind("0.0.0.0:0")
+            .ok()
+            .and_then(|s| {
+                s.connect("192.0.2.1:9").ok()?;
+                Some(s.local_addr().ok()?.ip().to_string())
+            })
+            .unwrap_or_else(|| "<server IP>".into());
         Self {
             stats,
             running_flag,
-            port_input: "9999".to_string(),
-            bitrate_input: "8000".to_string(),
-            keyframe_input: "10".to_string(),
-            show_help_dialog: false,
-            rt,
+            port_input: config.port.to_string(),
+            bitrate_input: config.bitrate.to_string(),
+            keyframe_input: config.keyframe_interval.to_string(),
+            fps_input: config.fps.to_string(),
+            output_input: config.output_name.clone().unwrap_or_default(),
+            config,
+            address,
+            started: None,
+            show_help: false,
+            rt: Runtime::new().expect("Tokio runtime"),
             server_task: None,
         }
     }
-
     fn start_server(&mut self) {
-        if self.running_flag.load(Ordering::SeqCst) || self.server_task.is_some() {
+        let parsed = (
+            self.port_input.parse::<u16>(),
+            self.fps_input.parse::<u32>(),
+            self.bitrate_input.parse::<u32>(),
+            self.keyframe_input.parse::<u32>(),
+        );
+        let (Ok(port), Ok(fps), Ok(bitrate), Ok(keyframe_interval)) = parsed else {
+            self.stats.lock().unwrap().status = "Enter valid numeric stream settings".into();
+            return;
+        };
+        if port == 0 || !(1..=240).contains(&fps) || bitrate < 1000 || keyframe_interval == 0 {
+            self.stats.lock().unwrap().status =
+                "Use port 1–65535, FPS 1–240, bitrate ≥1000 and keyframe interval ≥1".into();
             return;
         }
-
-        // Parse config
-        let port = self.port_input.trim().parse::<u16>().unwrap_or(9999);
-        let fps = 100; // Hardcoded FPS limit
-        let bitrate = self.bitrate_input.trim().parse::<u32>().unwrap_or(50000).max(1000);
-        let keyframe_interval = self.keyframe_input.trim().parse::<u32>().unwrap_or(2).max(1);
-
         let config = ServerConfig {
             port,
             fps,
             bitrate,
             keyframe_interval,
-            output_name: None, // Auto-mapping removed
-            tablet: TabletDescriptor::default(),
+            output_name: if self.output_input.trim().is_empty() {
+                None
+            } else {
+                Some(self.output_input.trim().into())
+            },
+            tablet: self.config.tablet.clone(),
         };
-
+        self.config = config.clone();
         let stats = self.stats.clone();
         let running = self.running_flag.clone();
+        {
+            let mut s = stats.lock().unwrap();
+            let logs = std::mem::take(&mut s.logs);
+            *s = ServerStats::default();
+            s.logs = logs;
+            s.status = "Selecting screen…".into();
+            s.log("Starting server".into());
+        }
         running.store(true, Ordering::SeqCst);
-
-        // Reset stats
-        {
-            let mut guard = stats.lock().unwrap();
-            let logs = guard.logs.clone(); // Persist logs across restarts
-            *guard = ServerStats::default();
-            guard.logs = logs;
-            guard.status = "Starting...".to_string();
-            guard.log("Starting server thread...".to_string());
-        }
-
-        // Spawn server task on the existing runtime
-        let task = self.rt.spawn(async move {
-            // We call run_server_async directly
-            if let Err(e) = crate::run_server_async(config, stats.clone(), running.clone()).await {
-                let mut guard = stats.lock().unwrap();
-                guard.status = format!("Error: {}", e);
-                guard.log(format!("Error: {}", e));
-            }
-
-            // When pipeline finishes, ensure running is false
+        self.started = Some(chrono::Local::now().format("%H:%M").to_string());
+        self.server_task = Some(self.rt.spawn(async move {
+            let result = crate::run_server_async(config, stats.clone(), running.clone()).await;
             running.store(false, Ordering::SeqCst);
-            let mut guard = stats.lock().unwrap();
-            guard.status = "Stopped".to_string();
-            guard.connected_client = None;
-            guard.log("Server stopped.".to_string());
-        });
-
-        self.server_task = Some(task);
-    }
-
-    fn stop_server(&mut self) {
-        {
-            let mut guard = self.stats.lock().unwrap();
-            guard.log("Stopping server...".to_string());
-        }
-        self.running_flag.store(false, Ordering::SeqCst);
+            let mut s = stats.lock().unwrap();
+            s.connected_client = None;
+            s.stylus_buttons = [false; 2];
+            match result {
+                Ok(()) => {
+                    s.status = "Stopped".into();
+                    s.log("Server stopped".into());
+                }
+                Err(e) => {
+                    s.status = format!("Error: {e}");
+                    let message = s.status.clone();
+                    s.log(message);
+                }
+            }
+        }));
     }
 }
-
+fn device_icon(ui: &mut egui::Ui, tablet: bool) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(54.0, 42.0), egui::Sense::hover());
+    ui.painter().rect(
+        rect,
+        10.0,
+        Color32::WHITE,
+        egui::Stroke::new(1.0_f32, BORDER),
+        egui::StrokeKind::Inside,
+    );
+    ui.put(
+        rect,
+        icon_image(
+            ui.ctx(),
+            if tablet { Icon::Tablet } else { Icon::Monitor },
+            32.0,
+        ),
+    );
+}
+fn banner_slot(ui: &mut egui::Ui, width: f32, contents: impl FnOnce(&mut egui::Ui)) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 88.0), egui::Sense::hover());
+    ui.scope_builder(
+        egui::UiBuilder::new()
+            .max_rect(rect)
+            .layout(egui::Layout::top_down(egui::Align::Center)),
+        contents,
+    );
+}
+fn card() -> egui::Frame {
+    egui::Frame::new()
+        .fill(Color32::WHITE)
+        .stroke(egui::Stroke::new(1.0_f32, BORDER))
+        .corner_radius(12)
+        .inner_margin(20)
+}
+fn field(ui: &mut egui::Ui, title: &str, value: &mut String, unit: &str) {
+    ui.label(title);
+    ui.add_space(5.0);
+    ui.horizontal(|ui| {
+        ui.add_sized(
+            [ui.available_width() - 48.0, 36.0],
+            egui::TextEdit::singleline(value).margin(egui::vec2(12.0, 9.0)),
+        );
+        ui.label(RichText::new(unit).color(MUTED));
+    });
+    ui.add_space(16.0);
+}
+fn metric(ui: &mut egui::Ui, title: &str, value: String, unit: &str) {
+    card().show(ui, |ui| {
+        ui.set_min_width(ui.available_width());
+        ui.label(RichText::new(title).color(MUTED));
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(value).size(34.0).strong());
+            ui.label(RichText::new(unit).color(MUTED));
+        });
+    });
+}
 impl eframe::App for DtServerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // --- Theme Configuration (Teal/Green) ---
-        let mut visuals = egui::Visuals::dark();
-        visuals.window_fill = egui::Color32::from_rgb(14, 22, 18); // Deep teal background
-        visuals.panel_fill = egui::Color32::from_rgb(14, 22, 18);
-
-        // Widget styles
-        visuals.widgets.noninteractive.bg_fill = egui::Color32::from_rgb(22, 36, 30); // Card background
-        visuals.widgets.noninteractive.fg_stroke =
-            egui::Stroke::new(1.0, egui::Color32::from_gray(180));
-
-        visuals.widgets.inactive.bg_fill = egui::Color32::from_rgb(28, 44, 36); // Input fields
-        visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(36, 56, 46);
-        visuals.widgets.active.bg_fill = egui::Color32::from_rgb(44, 68, 56);
-
-        visuals.selection.bg_fill = egui::Color32::from_rgb(91, 168, 140); // Accent Teal #5BA88C
+        let mut visuals = egui::Visuals::light();
+        visuals.panel_fill = BG;
+        visuals.window_fill = BG;
+        visuals.override_text_color = Some(INK);
+        visuals.widgets.inactive.bg_fill = Color32::WHITE;
+        visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0_f32, BORDER);
+        visuals.selection.bg_fill = Color32::from_rgb(203, 230, 214);
         ctx.set_visuals(visuals);
-
-        let is_running = self.running_flag.load(Ordering::SeqCst);
-
-        // Clean up finished task
-        if let Some(task) = &self.server_task {
-            if task.is_finished() {
-                // Task is done. We can drop the handle.
-                self.server_task = None;
-
-                // Ensure flag is false just in case
-                self.running_flag.store(false, Ordering::SeqCst);
-            }
+        if self.server_task.as_ref().is_some_and(|t| t.is_finished()) {
+            self.server_task = None;
+            self.running_flag.store(false, Ordering::SeqCst);
         }
-
-        let stats = {
-            let guard = self.stats.lock().unwrap();
-            guard.clone()
-        };
-
-        // --- Sidebar (Controls & Status) ---
-        egui::SidePanel::left("sidebar_panel")
-            .resizable(false)
-            .default_width(280.0)
-            .show(ctx, |ui| {
-                ui.add_space(20.0);
-                ui.vertical_centered(|ui| {
-                    ui.heading(
-                        egui::RichText::new("Drawing Tablet")
-                            .size(24.0)
-                            .strong()
-                            .color(egui::Color32::WHITE),
-                    );
-                    ui.label(
-                        egui::RichText::new("Server Control Center")
-                            .size(12.0)
-                            .color(egui::Color32::from_gray(140)),
-                    );
-                });
-
-                ui.add_space(30.0);
-
-                // Status Indicator
-                ui.group(|ui| {
-                    ui.set_width(ui.available_width());
-                    ui.vertical_centered(|ui| {
-                        ui.add_space(10.0);
-                        let (status_text, status_color) = if is_running {
-                            ("ACTIVE", egui::Color32::from_rgb(91, 200, 150))
-                        } else if self.server_task.is_some() {
-                            ("STOPPING", egui::Color32::from_rgb(200, 180, 80))
-                        } else {
-                            ("OFFLINE", egui::Color32::from_rgb(200, 90, 90))
-                        };
-
-                        ui.label(
-                            egui::RichText::new(status_text)
-                                .size(28.0)
-                                .strong()
-                                .color(status_color),
-                        );
-
-                        ui.add_space(5.0);
-                        ui.label(
-                            egui::RichText::new(&stats.status).color(egui::Color32::from_gray(180)),
-                        );
-                        ui.add_space(10.0);
-                    });
-                });
-
-                ui.add_space(20.0);
-
-                // Start/Stop Button
-                let (btn_text, btn_color) = if is_running {
-                    ("STOP SERVER", egui::Color32::from_rgb(180, 40, 40))
-                } else if self.server_task.is_some() {
-                    ("STOPPING...", egui::Color32::from_rgb(80, 80, 80))
-                } else {
-                    ("START SERVER", egui::Color32::from_rgb(58, 140, 110))
-                };
-
-                if ui
-                    .add_sized(
-                        egui::vec2(ui.available_width(), 50.0),
-                        egui::Button::new(
-                            egui::RichText::new(btn_text)
-                                .size(16.0)
-                                .strong()
-                                .color(egui::Color32::WHITE),
-                        )
-                        .fill(btn_color)
-                        .corner_radius(8.0),
-                    )
-                    .clicked()
-                {
-                    if is_running {
-                        self.stop_server();
-                    } else if self.server_task.is_none() {
-                        self.start_server();
-                    }
-                }
-
-                ui.add_space(30.0);
-
-                // Configuration (Sidebar)
-                ui.label(
-                    egui::RichText::new("CONFIGURATION")
-                        .size(12.0)
-                        .strong()
-                        .color(egui::Color32::from_gray(120)),
-                );
-                ui.add_space(5.0);
-
+        let running = self.running_flag.load(Ordering::SeqCst);
+        let busy = self.server_task.is_some();
+        let stats = self.stats.lock().unwrap().clone();
+        let streaming = running && stats.connected_client.is_some() && stats.status == "Running";
+        egui::TopBottomPanel::top("stream_banner")
+            .exact_height(136.0)
+            .frame(
                 egui::Frame::new()
-                    .fill(egui::Color32::from_rgb(18, 28, 24))
-                    .corner_radius(8.0)
-                    .inner_margin(10.0)
-                    .show(ui, |ui| {
-                        ui.add_enabled_ui(!is_running, |ui| {
-                            let grid = egui::Grid::new("config_grid")
-                                .num_columns(2)
-                                .spacing([10.0, 15.0])
-                                .striped(false);
-
-                            grid.show(ui, |ui| {
-                                ui.label("Port");
-                                ui.add(
-                                    egui::TextEdit::singleline(&mut self.port_input)
-                                        .desired_width(100.0),
-                                );
-                                ui.end_row();
-
-                                ui.label("Bitrate (kbps)");
-                                ui.add(
-                                    egui::TextEdit::singleline(&mut self.bitrate_input)
-                                        .desired_width(100.0),
-                                );
-                                ui.end_row();
-
-                                ui.label("Keyframe Int");
-                                ui.add(
-                                    egui::TextEdit::singleline(&mut self.keyframe_input)
-                                        .desired_width(100.0),
-                                );
-                                ui.end_row();
+                    .fill(Color32::from_rgb(230, 240, 234))
+                    .inner_margin(24),
+            )
+            .show(ctx, |ui| {
+                ui.horizontal_centered(|ui| {
+                    let flow_width = (ui.available_width() - 774.0).max(70.0);
+                    banner_slot(ui, 205.0, |ui| {
+                        ui.set_width(205.0);
+                        ui.horizontal(|ui| {
+                            let (r, _) =
+                                ui.allocate_exact_size(Vec2::splat(18.0), egui::Sense::hover());
+                            ui.painter()
+                                .circle_filled(r.center(), 9.0, GREEN.gamma_multiply(0.18));
+                            ui.painter().circle_filled(
+                                r.center(),
+                                5.0,
+                                if running { GREEN } else { MUTED },
+                            );
+                            ui.heading(if streaming {
+                                "Streaming"
+                            } else if running {
+                                "Starting / waiting"
+                            } else {
+                                "Stopped"
                             });
+                        });
+                        ui.label(
+                            RichText::new(if running {
+                                format!("Started {}", self.started.as_deref().unwrap_or(""))
+                            } else {
+                                stats.status.clone()
+                            })
+                            .small()
+                            .color(MUTED),
+                        );
+                    });
+                    banner_slot(ui, 90.0, |ui| {
+                        ui.set_width(90.0);
+                        device_icon(ui, false);
+                        ui.label("This screen");
+                        ui.label(
+                            RichText::new(if stats.resolution.is_empty() {
+                                "Select on start"
+                            } else {
+                                &stats.resolution
+                            })
+                            .small()
+                            .color(MUTED),
+                        );
+                    });
+                    let arrow_width = flow_width;
+                    banner_slot(ui, arrow_width, |ui| {
+                        ui.set_width(arrow_width);
+                        ui.label(RichText::new("video").small().color(MUTED));
+                        let (rect, _) = ui.allocate_exact_size(
+                            Vec2::new(arrow_width, 32.0),
+                            egui::Sense::hover(),
+                        );
+                        let p = ui.painter();
+                        for row in 0..2 {
+                            let y = rect.top() + 8.0 + row as f32 * 16.0;
+                            let mut x = rect.left();
+                            while x < rect.right() - 10.0 {
+                                p.line_segment(
+                                    [
+                                        egui::pos2(x, y),
+                                        egui::pos2((x + 9.0).min(rect.right() - 10.0), y),
+                                    ],
+                                    egui::Stroke::new(1.5_f32, GREEN),
+                                );
+                                x += 18.0;
+                            }
+                            let x = if row == 0 {
+                                rect.right() - 5.0
+                            } else {
+                                rect.left()
+                            };
+                            let sign = if row == 0 { -1.0 } else { 1.0 };
+                            p.line_segment(
+                                [egui::pos2(x, y), egui::pos2(x + sign * 5.0, y - 4.0)],
+                                egui::Stroke::new(1.5_f32, GREEN),
+                            );
+                            p.line_segment(
+                                [egui::pos2(x, y), egui::pos2(x + sign * 5.0, y + 4.0)],
+                                egui::Stroke::new(1.5_f32, GREEN),
+                            );
+                        }
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.label(RichText::new("stylus").small().color(MUTED));
                         });
                     });
-                
-                ui.add_space(20.0);
-                
-                // Help Button
-                 if ui
-                    .add_sized(
-                        egui::vec2(ui.available_width(), 30.0),
-                        egui::Button::new(
-                            egui::RichText::new("❓ Touch Mapping Help")
-                                .size(14.0)
-                                .color(egui::Color32::from_gray(200)),
+                    banner_slot(ui, 115.0, |ui| {
+                        ui.set_width(115.0);
+                        device_icon(ui, true);
+                        ui.label("Tablet");
+                        ui.label(
+                            RichText::new(
+                                stats.connected_client.as_deref().unwrap_or("Not connected"),
+                            )
+                            .small()
+                            .color(MUTED),
+                        );
+                    });
+                    banner_slot(ui, 190.0, |ui| {
+                        ui.set_width(190.0);
+                        ui.label(RichText::new("Tablet connects to").small().color(MUTED));
+                        let address = format!("{}:{}", self.address, self.config.port);
+                        if ui
+                            .add(
+                                egui::Button::image_and_text(
+                                    icon_image(ui.ctx(), Icon::Copy, 16.0),
+                                    RichText::new(&address).monospace(),
+                                )
+                                .frame(false),
+                            )
+                            .on_hover_text("Copy server address")
+                            .clicked()
+                        {
+                            ctx.copy_text(address);
+                        }
+                    });
+                    if ui
+                        .add_enabled(
+                            running || !busy,
+                            egui::Button::image_and_text(
+                                icon_image(
+                                    ui.ctx(),
+                                    if running || busy {
+                                        Icon::Stop
+                                    } else {
+                                        Icon::Start
+                                    },
+                                    18.0,
+                                ),
+                                if running {
+                                    "Stop server"
+                                } else if busy {
+                                    "Stopping…"
+                                } else {
+                                    "Start server"
+                                },
+                            )
+                            .min_size(Vec2::new(126.0, 40.0)),
                         )
-                        .fill(egui::Color32::from_rgb(28, 44, 36))
-                        .corner_radius(6.0),
-                    )
-                    .clicked()
-                {
-                    self.show_help_dialog = true;
-                }
-
-                ui.add_space(20.0);
-
-                // Footer info
-                if is_running {
-                    if let Some(client) = &stats.connected_client {
-                        ui.label(
-                            egui::RichText::new(format!("Connected: {}", client))
-                                .size(11.0)
-                                .color(egui::Color32::from_rgb(91, 200, 150)),
-                        );
-                    } else {
-                        ui.label(
-                            egui::RichText::new("Waiting for client...")
-                                .size(11.0)
-                                .color(egui::Color32::from_rgb(200, 180, 80)),
-                        );
+                        .clicked()
+                    {
+                        if running {
+                            self.running_flag.store(false, Ordering::SeqCst);
+                            self.stats.lock().unwrap().log("Stopping server…".into());
+                        } else {
+                            self.start_server();
+                        }
                     }
+                });
+            });
+        egui::SidePanel::left("settings")
+            .exact_width(320.0)
+            .resizable(false)
+            .frame(egui::Frame::new().fill(BG).inner_margin(26))
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.add(icon_image(ui.ctx(), Icon::Pen, 28.0));
+                    ui.label(RichText::new("Drawing Tablet").strong());
+                    ui.label(RichText::new("Server").color(MUTED));
+                });
+                ui.add_space(32.0);
+                ui.label(RichText::new("Stream settings").color(MUTED));
+                ui.add_space(16.0);
+                ui.add_enabled_ui(!busy, |ui| {
+                    field(ui, "Port", &mut self.port_input, "");
+                    field(ui, "Bitrate", &mut self.bitrate_input, "kbps");
+                    field(ui, "Keyframe interval", &mut self.keyframe_input, "frames");
+                    field(ui, "Frame rate", &mut self.fps_input, "fps");
+                    field(ui, "Input monitor", &mut self.output_input, "");
                     ui.label(
-                        egui::RichText::new(format!("Source: {}", stats.resolution))
-                            .size(11.0)
-                            .color(egui::Color32::from_gray(150)),
+                        RichText::new(
+                            "Leave blank to follow screen selection.\nOverride example: DP-3",
+                        )
+                        .small()
+                        .color(MUTED),
                     );
-                }
-            });
-
-        // --- Main Content (Stats & Logs) ---
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.add_space(10.0);
-
-            // Statistics Cards
-            ui.label(
-                egui::RichText::new("PERFORMANCE METRICS")
-                    .size(12.0)
-                    .strong()
-                    .color(egui::Color32::from_gray(120)),
-            );
-            ui.add_space(5.0);
-
-            ui.horizontal(|ui| {
-                ui.columns(3, |columns| {
-                    self.stat_card(&mut columns[0], "Encoded FPS", &stats.encoded.to_string());
-                    self.stat_card(&mut columns[1], "Packets Sent", &stats.sent.to_string());
-                    self.stat_card(&mut columns[2], "Dropped Frames", &stats.dropped.to_string());
+                });
+                ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
+                    if ui
+                        .add(
+                            egui::Button::image_and_text(
+                                icon_image(ui.ctx(), Icon::Help, 18.0),
+                                "Input mapping help",
+                            )
+                            .frame(false),
+                        )
+                        .clicked()
+                    {
+                        self.show_help = true;
+                    }
                 });
             });
-
-            ui.add_space(20.0);
-
-            // Stylus Button Status
-            ui.label(
-                egui::RichText::new("STYLUS STATUS")
-                    .size(12.0)
-                    .strong()
-                    .color(egui::Color32::from_gray(120)),
-            );
-            ui.add_space(5.0);
-
-            ui.horizontal(|ui| {
-                ui.columns(2, |columns| {
-                    // Button 0
-                    let color0 = if stats.stylus_buttons[0] { egui::Color32::from_rgb(91, 168, 140) } else { egui::Color32::from_gray(50) };
-                    egui::Frame::new()
-                        .fill(egui::Color32::from_rgb(22, 36, 30))
-                        .corner_radius(6.0)
-                        .inner_margin(12.0)
-                        .show(&mut columns[0], |ui| {
-                            ui.set_width(ui.available_width());
-                            ui.horizontal(|ui| {
-                                ui.label("Button 1 (Side)");
-                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                    ui.painter().circle_filled(ui.available_rect_before_wrap().center(), 8.0, color0);
-                                });
-                            });
-                        });
-    
-                    // Button 1
-                    let color1 = if stats.stylus_buttons[1] { egui::Color32::from_rgb(91, 168, 140) } else { egui::Color32::from_gray(50) };
-                    egui::Frame::new()
-                        .fill(egui::Color32::from_rgb(22, 36, 30))
-                        .corner_radius(6.0)
-                        .inner_margin(12.0)
-                        .show(&mut columns[1], |ui| {
-                            ui.set_width(ui.available_width());
-                            ui.horizontal(|ui| {
-                                ui.label("Button 2 (Eraser)");
-                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                    ui.painter().circle_filled(ui.available_rect_before_wrap().center(), 8.0, color1);
-                                });
-                            });
-                        });
+        egui::CentralPanel::default()
+            .frame(egui::Frame::new().fill(BG).inner_margin(28))
+            .show(ctx, |ui| {
+                ui.columns(3, |cols| {
+                    metric(
+                        &mut cols[0],
+                        "Encoded frame rate",
+                        stats.encoded.to_string(),
+                        "fps",
+                    );
+                    metric(&mut cols[1], "Packets sent", stats.sent.to_string(), "");
+                    metric(
+                        &mut cols[2],
+                        "Dropped frames",
+                        stats.dropped.to_string(),
+                        "",
+                    );
                 });
-            });
-
-            ui.add_space(20.0);
-
-            // Logs
-            ui.label(
-                egui::RichText::new("SYSTEM LOGS")
-                    .size(12.0)
-                    .strong()
-                    .color(egui::Color32::from_gray(120)),
-            );
-            ui.add_space(5.0);
-
-            egui::Frame::new()
-                .fill(egui::Color32::from_rgb(12, 20, 16))
-                .corner_radius(6.0)
-                .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(26, 42, 34)))
-                .inner_margin(10.0)
-                .show(ui, |ui| {
+                ui.add_space(20.0);
+                card().show(ui, |ui| {
+                    ui.set_min_width(ui.available_width());
+                    ui.horizontal(|ui| {
+                        ui.add(icon_image(ui.ctx(), Icon::Stylus, 20.0));
+                        ui.label(RichText::new("Stylus").color(MUTED));
+                        ui.add_space(48.0);
+                        for (i, label) in ["Button 1   side", "Button 2   secondary"]
+                            .iter()
+                            .enumerate()
+                        {
+                            egui::Frame::new()
+                                .fill(if stats.stylus_buttons[i] {
+                                    Color32::from_rgb(231, 242, 235)
+                                } else {
+                                    BG
+                                })
+                                .stroke(egui::Stroke::new(
+                                    1.0_f32,
+                                    if stats.stylus_buttons[i] {
+                                        GREEN
+                                    } else {
+                                        BORDER
+                                    },
+                                ))
+                                .corner_radius(7)
+                                .inner_margin(10)
+                                .show(ui, |ui| {
+                                    ui.label(format!(
+                                        "{}  {label}",
+                                        if stats.stylus_buttons[i] {
+                                            "●"
+                                        } else {
+                                            "○"
+                                        }
+                                    ));
+                                });
+                        }
+                    });
+                });
+                ui.add_space(20.0);
+                card().show(ui, |ui| {
+                    ui.set_min_width(ui.available_width());
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("Log").color(MUTED));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui
+                                .add(
+                                    egui::Button::image_and_text(
+                                        icon_image(ui.ctx(), Icon::Clear, 16.0),
+                                        "Clear",
+                                    )
+                                    .frame(false),
+                                )
+                                .clicked()
+                            {
+                                self.stats.lock().unwrap().logs.clear();
+                            }
+                        });
+                    });
+                    ui.add_space(10.0);
+                    ui.separator();
+                    ui.add_space(10.0);
                     egui::ScrollArea::vertical()
                         .stick_to_bottom(true)
-                        .auto_shrink([false, false])
                         .show(ui, |ui| {
-                            ui.set_min_height(ui.available_height());
+                            ui.set_min_height(ui.available_height().max(100.0) - 5.0);
                             for log in &stats.logs {
-                                ui.label(
-                                    egui::RichText::new(log)
-                                        .family(egui::FontFamily::Monospace)
-                                        .size(11.0)
-                                        .color(egui::Color32::from_gray(180)),
-                                );
+                                ui.label(RichText::new(log).monospace().size(12.0));
                             }
                         });
                 });
-        });
-
-        // Periodic repaint
-        ctx.request_repaint_after(std::time::Duration::from_millis(100));
-
-        // Help Window
-        if self.show_help_dialog {
-            let mut open = true;
-            egui::Window::new("Touchscreen Mapping Help")
-                .open(&mut open)
-                .resizable(false)
-                .collapsible(false)
-                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
-                .show(ctx, |ui| {
-                    ui.set_max_width(400.0);
-                    ui.heading("Touch Input on Wrong Screen?");
-                    ui.add_space(10.0);
-                    ui.label("If your touch input appears on the wrong monitor, you need to map the virtual tablet to the correct display in your OS settings.");
-                    ui.add_space(10.0);
-                    
-                    ui.label(egui::RichText::new("KDE Plasma (Linux)").strong().color(egui::Color32::WHITE));
-                    ui.label("1. Open System Settings.");
-                    ui.label("2. Go to Input Devices > Touchscreen.");
-                    ui.label("3. Select 'Drawing Tablet Touchscreen'.");
-                    ui.label("4. Change 'Output' to match the monitor you are drawing on.");
-                    ui.add_space(10.0);
-                    
-                    ui.label(egui::RichText::new("GNOME (Linux)").strong().color(egui::Color32::WHITE));
-                    ui.label("1. Open Settings > Wacom Tablet.");
-                    ui.label("2. Or use the command line: `xsetwacom` (if using X11).");
-                    ui.label("   For Wayland, mapping is usually automatic or requires specific GNOME extensions.");
-                });
-            self.show_help_dialog = open;
+            });
+        if self.show_help {
+            egui::Window::new("Input mapping help").open(&mut self.show_help).show(ctx, |ui| {ui.set_max_width(480.0); ui.label("On KDE Wayland, the server maps its virtual pen and touch devices to the screen selected in the sharing dialog. Your mouse can stay on another screen."); ui.add_space(12.0); ui.label(&stats.mapping); ui.add_space(12.0); ui.label("If automatic detection fails, stop the server, enter the display connector (for example DP-3) in Input monitor, then select that same screen when restarting. List connectors with kscreen-doctor -o."); ui.label("On other desktops, map Drawing Tablet Pen and Drawing Tablet Touch to the selected output in your desktop settings. A shared desktop may still change keyboard focus when you interact with a window."); });
         }
+        ctx.request_repaint_after(Duration::from_millis(100));
     }
 }
-
-impl DtServerApp {
-    // Helper for rendering stat cards
-    fn stat_card(&self, ui: &mut egui::Ui, title: &str, value: &str) {
-        egui::Frame::new()
-            .fill(egui::Color32::from_rgb(22, 36, 30))
-            .corner_radius(6.0)
-            .inner_margin(12.0)
-            .show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                ui.vertical(|ui| {
-                    ui.label(
-                        egui::RichText::new(title)
-                            .size(11.0)
-                            .color(egui::Color32::from_gray(160)),
-                    );
-                    ui.add_space(2.0);
-                    ui.label(
-                        egui::RichText::new(value)
-                            .size(20.0)
-                            .strong()
-                            .color(egui::Color32::WHITE),
-                    );
-                });
-            });
+impl Drop for DtServerApp {
+    fn drop(&mut self) {
+        self.running_flag.store(false, Ordering::SeqCst);
     }
 }

@@ -51,3 +51,9 @@ dt-protocol = { path = "crates/dt-protocol" }
 dt-input = { path = "crates/dt-input" }
 dt-capture = { path = "crates/dt-capture" }
 dt-encoder = { path = "crates/dt-encoder" }
+
+# Older bindgen emits opaque PipeWire types with Clang 22+. These patches
+# only update the binding generator, preserving the current PipeWire API.
+[patch.crates-io]
+libspa-sys = { path = "vendor/libspa-sys" }
+pipewire-sys = { path = "vendor/pipewire-sys" }
