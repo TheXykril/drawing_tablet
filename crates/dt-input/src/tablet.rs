@@ -528,9 +528,12 @@ impl VirtualTablet {
             button,
             if pressed { "pressed" } else { "released" }
         );
+        // The primary pen button (e.g. the S Pen side button) maps to BTN_STYLUS2,
+        // which Wayland apps treat as a right click (Krita: popup palette).
+        // BTN_STYLUS is a middle click, which Krita uses for panning.
         let key = match button {
-            0 => Key::BTN_STYLUS,
-            1 => Key::BTN_STYLUS2,
+            0 => Key::BTN_STYLUS2,
+            1 => Key::BTN_STYLUS,
             _ => return Ok(()), // Ignore unknown buttons
         };
 
