@@ -490,7 +490,12 @@ async fn run_server(
             }
             while let Some(frame) = capture.try_recv_frame() {
                 stats_captured += 1;
-                last_frame = Some(frame.clone());
+                // Only cache CPU-memory frames. Cloning a DMA-BUF frame would copy
+                // its fd, and FrameData closes the fd on drop (double close).
+                last_frame = match frame.data {
+                    dt_capture::FrameData::MemPtr(_) => Some(frame.clone()),
+                    _ => None,
+                };
                 last_frame_time = Instant::now();
                 idle_repeats = 0;
                 match frame_tx.try_send(frame) {
