@@ -313,6 +313,12 @@ async fn run_server(
     let mut last_frame_time = Instant::now();
     let mut idle_repeats: u32 = 0;
 
+    // Touch boost: after any finger touch, send frames at full rate for a while
+    // even if the screen is idle, starting with a fresh keyframe.
+    const TOUCH_BOOST_DURATION: Duration = Duration::from_millis(1500);
+    let boost_frame_interval = Duration::from_micros(1_000_000 / fps.max(1) as u64);
+    let mut boost_until: Option<Instant> = None;
+
     // Per-second stats
     let mut stats_captured: u64 = 0;
     let mut stats_encoded: u64 = 0;
@@ -426,6 +432,23 @@ async fn run_server(
                                 if let Err(e) = tablet.process_event(&input.event) {
                                     warn!("Failed to process input: {}", e);
                                 }
+
+                                // Any finger touch starts (or extends) the full-rate boost.
+                                if matches!(
+                                    input.event,
+                                    dt_protocol::InputEvent::TouchDown { .. }
+                                        | dt_protocol::InputEvent::TouchMove { .. }
+                                        | dt_protocol::InputEvent::TouchUp { .. }
+                                ) {
+                                    let boost_active =
+                                        boost_until.is_some_and(|t| Instant::now() < t);
+                                    if !boost_active {
+                                        // Fresh keyframe on the next frame we send.
+                                        keyframe_requested = true;
+                                        idle_repeats = 1;
+                                    }
+                                    boost_until = Some(Instant::now() + TOUCH_BOOST_DURATION);
+                                }
                             }
                             Ok(DecodedPacket::Video(_)) => {
                                 // Ignore video packets from clients
@@ -478,9 +501,17 @@ async fn run_server(
             // is idle, repeat the last frame so a lost UDP packet cannot leave the
             // tablet frozen or corrupted. The first repeat after a change and then
             // one per second are keyframes, so the client can always recover.
+            let boosting = boost_until.is_some_and(|t| Instant::now() < t);
+            let repeat_interval = if boosting {
+                boost_frame_interval
+            } else {
+                IDLE_REPEAT_INTERVAL
+            };
             if let Some(ref f) = last_frame {
-                if last_frame_time.elapsed() > IDLE_REPEAT_INTERVAL {
-                    if idle_repeats % 5 == 0 {
+                if last_frame_time.elapsed() > repeat_interval {
+                    // Idle keyframe once per second (every 5th repeat). During a
+                    // boost, repeats come at full rate, so skip those extra keyframes.
+                    if !boosting && idle_repeats % 5 == 0 {
                         keyframe_flag.store(true, Ordering::SeqCst);
                     }
                     idle_repeats = idle_repeats.wrapping_add(1);
