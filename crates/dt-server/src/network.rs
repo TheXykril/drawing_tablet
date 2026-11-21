@@ -56,7 +56,15 @@ impl UdpServer {
         Ok(())
     }
 
+    /// Convert into a blocking std socket for use on a dedicated thread.
+    pub fn into_std(self) -> Result<std::net::UdpSocket, NetworkError> {
+        let socket = self.socket.into_std()?;
+        socket.set_nonblocking(false)?;
+        Ok(socket)
+    }
+
     /// Send multiple packets to the same address efficiently.
+    #[allow(dead_code)]
     pub async fn send_batch(&self, packets: &[&[u8]], addr: SocketAddr) -> Result<(), NetworkError> {
         for packet in packets {
             self.socket.send_to(packet, addr).await?;

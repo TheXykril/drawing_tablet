@@ -252,6 +252,29 @@ async fn run_server(
     stats: Arc<Mutex<ServerStats>>,
     running: Arc<AtomicBool>,
 ) -> Result<()> {
+    // Dedicated video sender thread. It paces UDP fragments with real
+    // microsecond sleeps (tokio timers round up to about 1 ms) and runs apart
+    // from the main loop, so large keyframes no longer delay input events.
+    let (video_send_tx, video_send_rx) =
+        mpsc::sync_channel::<(SocketAddr, Vec<Vec<u8>>)>(2);
+    let udp_socket = udp_server.into_std()?;
+    std::thread::Builder::new()
+        .name("video-send".into())
+        .spawn(move || {
+            const BATCH_SIZE: usize = 8;
+            const PACING_DELAY: Duration = Duration::from_micros(150);
+            while let Ok((addr, packets)) = video_send_rx.recv() {
+                for chunk in packets.chunks(BATCH_SIZE) {
+                    for p in chunk {
+                        if let Err(e) = udp_socket.send_to(p, addr) {
+                            debug!("Failed to send video fragment: {}", e);
+                        }
+                    }
+                    std::thread::sleep(PACING_DELAY);
+                }
+            }
+        })?;
+
     let (frame_tx, frame_rx) = mpsc::sync_channel(1);
     let (encoded_tx, encoded_rx) = mpsc::sync_channel(2);
     let encoder_running = Arc::new(AtomicBool::new(true));
@@ -582,19 +605,21 @@ async fn run_server(
                     }
 
                     if all_sent && !fragment_packets.is_empty() {
-                        const BATCH_SIZE: usize = 8;
-                        const PACING_DELAY: Duration = Duration::from_micros(100);
-
-                        let packet_refs: Vec<&[u8]> =
-                            fragment_packets.iter().map(|p| p.as_slice()).collect();
-
-                        for chunk in packet_refs.chunks(BATCH_SIZE) {
-                            if let Err(e) = udp_server.send_batch(chunk, addr).await {
-                                warn!("Failed to send video fragments: {}", e);
+                        // Hand the frame to the sender thread so pacing never delays
+                        // pen input handling in this loop. If the sender is still busy
+                        // with older frames, drop this one and ask for a keyframe,
+                        // because later P-frames would reference the missing frame.
+                        match video_send_tx.try_send((addr, fragment_packets)) {
+                            Ok(()) => {}
+                            Err(mpsc::TrySendError::Full(_)) => {
                                 all_sent = false;
-                                break;
+                                stats_dropped_frames += 1;
+                                keyframe_flag.store(true, Ordering::SeqCst);
                             }
-                            tokio::time::sleep(PACING_DELAY).await;
+                            Err(mpsc::TrySendError::Disconnected(_)) => {
+                                warn!("Video sender thread stopped");
+                                all_sent = false;
+                            }
                         }
                     }
                     if all_sent {
