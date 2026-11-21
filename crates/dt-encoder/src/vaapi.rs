@@ -215,10 +215,23 @@ impl VideoEncoder {
     }
 
     /// Encode a captured frame.
-    pub fn encode(&mut self, frame: &Frame) -> Result<Option<EncodedFrame>, EncoderError> {
-        let mut buffer = match &frame.data {
+    ///
+    /// Takes the frame by value so tightly packed BGRA/BGRx data can be handed
+    /// to GStreamer without copying. Returns every encoded frame that is ready,
+    /// waiting briefly for the output of this frame so it is not held back
+    /// until the next frame arrives.
+    pub fn encode(&mut self, mut frame: Frame) -> Result<Vec<EncodedFrame>, EncoderError> {
+        let row_len = frame.width as usize * 4;
+        let zero_copy = matches!(frame.format, PixelFormat::Bgra | PixelFormat::Bgrx)
+            && frame.stride as usize == row_len
+            && matches!(&frame.data, FrameData::MemPtr(d) if d.len() == row_len * frame.height as usize);
+        let meta = frame_meta(&frame);
+        let mut buffer = match &mut frame.data {
+            FrameData::MemPtr(data) if zero_copy => {
+                gst::Buffer::from_mut_slice(std::mem::take(data))
+            }
             FrameData::MemPtr(data) => {
-                let normalized = self.normalize_frame_data(frame, data)?;
+                let normalized = self.normalize_frame_data(&meta, data)?;
                 let mut buf = gst::Buffer::with_size(normalized.len())
                     .map_err(|e| EncoderError::EncodingFailed(e.to_string()))?;
 
@@ -321,8 +334,14 @@ impl VideoEncoder {
 
         self.frame_count += 1;
 
-        // Try to pull encoded frame
-        self.pull_encoded_frame()
+        // Wait for this frame's output, then collect anything else that is ready.
+        let mut out = Vec::new();
+        let mut timeout = gst::ClockTime::from_mseconds(50);
+        while let Some(encoded) = self.pull_encoded_frame(timeout)? {
+            out.push(encoded);
+            timeout = gst::ClockTime::ZERO;
+        }
+        Ok(out)
     }
 
     fn normalize_frame_data(&self, frame: &Frame, data: &[u8]) -> Result<Vec<u8>, EncoderError> {
@@ -386,10 +405,11 @@ impl VideoEncoder {
     }
 
     /// Pull an encoded frame from the pipeline (non-blocking).
-    fn pull_encoded_frame(&mut self) -> Result<Option<EncodedFrame>, EncoderError> {
-        match self
-            .appsink
-            .try_pull_sample(gst::ClockTime::from_mseconds(0))
+    fn pull_encoded_frame(
+        &mut self,
+        timeout: gst::ClockTime,
+    ) -> Result<Option<EncodedFrame>, EncoderError> {
+        match self.appsink.try_pull_sample(timeout)
         {
             Some(sample) => {
                 let buffer = sample
@@ -530,5 +550,17 @@ mod tests {
         // Non-IDR slice
         let non_idr = &[0x00, 0x00, 0x00, 0x01, 0x41, 0x9A];
         assert!(!is_h264_keyframe(non_idr));
+    }
+}
+
+/// A data-less copy of a frame's metadata, so `normalize_frame_data` can be
+/// called while the frame's data is mutably borrowed.
+fn frame_meta(frame: &Frame) -> Frame {
+    Frame {
+        width: frame.width,
+        height: frame.height,
+        format: frame.format,
+        stride: frame.stride,
+        data: FrameData::MemPtr(Vec::new()),
     }
 }

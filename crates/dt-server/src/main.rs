@@ -297,16 +297,17 @@ async fn run_server(
                 encoder.request_keyframe();
             }
 
-            match encoder.encode(&frame) {
-                Ok(Some(mut encoded)) => {
-                    let pts =
-                        pts_counter_clone.fetch_add(1_000_000 / (fps as u64), Ordering::SeqCst);
-                    encoded.pts = pts;
-                    if encoded_tx.send(encoded).is_err() {
-                        break;
+            match encoder.encode(frame) {
+                Ok(frames) => {
+                    for mut encoded in frames {
+                        let pts = pts_counter_clone
+                            .fetch_add(1_000_000 / (fps as u64), Ordering::SeqCst);
+                        encoded.pts = pts;
+                        if encoded_tx.send(encoded).is_err() {
+                            return;
+                        }
                     }
                 }
-                Ok(None) => {}
                 Err(e) => {
                     warn!("Encoding error: {}", e);
                 }
