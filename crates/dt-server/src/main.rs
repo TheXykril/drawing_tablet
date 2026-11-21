@@ -93,6 +93,9 @@ fn main() -> Result<()> {
     native_options.viewport.inner_size = Some(eframe::egui::vec2(1280.0, 800.0));
 
     native_options.viewport.min_inner_size = Some(eframe::egui::vec2(1040.0, 740.0));
+    // With vsync on, eglSwapBuffers blocks while the window is hidden on Wayland
+    // (e.g. on another workspace), so the app stops answering compositor pings.
+    native_options.vsync = false;
 
     // Load icon
     let icon_data = include_bytes!("../assets/icon.png");
@@ -304,6 +307,12 @@ async fn run_server(
     // Event retimer for smooth input delivery
     let mut event_retimer = EventRetimer::new();
 
+    // Idle frame repeat state
+    const IDLE_REPEAT_INTERVAL: Duration = Duration::from_millis(200);
+    let mut last_frame: Option<dt_capture::Frame> = None;
+    let mut last_frame_time = Instant::now();
+    let mut idle_repeats: u32 = 0;
+
     // Per-second stats
     let mut stats_captured: u64 = 0;
     let mut stats_encoded: u64 = 0;
@@ -410,8 +419,13 @@ async fn run_server(
                                     }
                                 }
 
-                                // Push to retimer for smooth delivery
-                                event_retimer.push(input);
+                                // Deliver immediately. The retimer released at most one event
+                                // per loop iteration and dropped the oldest events when its
+                                // buffer filled, which could lose StylusUp/StylusDown and join
+                                // separate strokes with a straight line.
+                                if let Err(e) = tablet.process_event(&input.event) {
+                                    warn!("Failed to process input: {}", e);
+                                }
                             }
                             Ok(DecodedPacket::Video(_)) => {
                                 // Ignore video packets from clients
@@ -460,8 +474,25 @@ async fn run_server(
 
         // 1. Send captured frames to encoder
         if client.is_some() {
+            // The compositor only sends frames when the screen changes. If the screen
+            // is idle, repeat the last frame so a lost UDP packet cannot leave the
+            // tablet frozen or corrupted. The first repeat after a change and then
+            // one per second are keyframes, so the client can always recover.
+            if let Some(ref f) = last_frame {
+                if last_frame_time.elapsed() > IDLE_REPEAT_INTERVAL {
+                    if idle_repeats % 5 == 0 {
+                        keyframe_flag.store(true, Ordering::SeqCst);
+                    }
+                    idle_repeats = idle_repeats.wrapping_add(1);
+                    last_frame_time = Instant::now();
+                    let _ = frame_tx.try_send(f.clone());
+                }
+            }
             while let Some(frame) = capture.try_recv_frame() {
                 stats_captured += 1;
+                last_frame = Some(frame.clone());
+                last_frame_time = Instant::now();
+                idle_repeats = 0;
                 match frame_tx.try_send(frame) {
                     Ok(_) => {}
                     Err(mpsc::TrySendError::Full(_)) => {

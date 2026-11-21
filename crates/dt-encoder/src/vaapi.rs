@@ -122,14 +122,21 @@ impl VideoEncoder {
                 let vaapi_str = format!(
                     "appsrc name=src format=time is-live=true do-timestamp=true \
                      caps=video/x-raw,format=BGRA,width={width},height={height},framerate={fps}/1 ! \
-                     vaapipostproc ! \
-                     video/x-raw,format=NV12 ! \
-                     vaapih264enc rate-control=cbr bitrate={bitrate} keyframe-period={keyframe} \
-                     tune=low-latency refs=1 num-slices=1 ! \
-                     video/x-h264,stream-format=byte-stream,alignment=au ! \
+                     vapostproc ! \
+                     video/x-raw(memory:VAMemory),format=NV12,width={out_w},height={out_h} ! \
+                     vah264enc rate-control=cbr bitrate={bitrate} key-int-max={keyframe} \
+                     b-frames=0 ref-frames=1 target-usage=4 aud=true ! \
+                     video/x-h264,stream-format=byte-stream,alignment=au,profile=main ! \
                      appsink name=sink emit-signals=true sync=false",
                     width = config.width,
                     height = config.height,
+                    // Scale on the GPU to at most 2560 px wide. This keeps H.264 at
+                    // level 5.1, which most Android decoders support, and spends the
+                    // bitrate on fewer pixels.
+                    out_w = config.width.min(2560),
+                    out_h = ((config.height as u64 * config.width.min(2560) as u64
+                        / config.width as u64) as u32)
+                        & !1,
                     fps = config.fps,
                     bitrate = config.bitrate,
                     keyframe = config.keyframe_interval,
@@ -145,7 +152,7 @@ impl VideoEncoder {
                         let x264_str = format!(
                             "appsrc name=src format=time is-live=true do-timestamp=true \
                              caps=video/x-raw,format=BGRA,width={width},height={height},framerate={fps}/1 ! \
-                             videoconvert ! \
+                             videoconvert ! video/x-raw,format=I420 ! \
                              x264enc tune=zerolatency speed-preset=superfast bitrate={bitrate} \
                              key-int-max={keyframe} b-adapt=0 cabac=true aud=true ! \
                              video/x-h264,stream-format=byte-stream,alignment=au ! \
